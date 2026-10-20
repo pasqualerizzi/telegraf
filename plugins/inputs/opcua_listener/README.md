@@ -299,13 +299,19 @@ to use them.
   #   # identifier_type = ""
   #   ## Specifies OPCUA Event sources to filter on
   #   # source_names = ["SourceName1", "SourceName2"]
+  #   ## Only report events of these types or their subtypes (OfType filter).
+  #   ## Accepts node ID strings incl. namespace URIs ("nsu=...;i=1").
+  #   ## Independent from 'event_type_node' which is used to resolve 'fields'.
+  #   # event_type_filter = ["ns=2;i=1"]
   #   ## Fields to capture from event notifications.
   #   ## Fields support namespace-qualified names using "ns:name" format
   #   ## (e.g. "2:TEXT01") and nested browse paths using "/" as separator
   #   ## (e.g. "AckedState/Id" or "2:AckedState/0:Id").
   #   fields = ["Severity", "Message", "Time"]
   #
-  #   ## Type or level of events to capture from the monitored nodes.
+  #   ## Event type used as the starting point to resolve the 'fields' browse
+  #   ## paths (TypeDefinitionId of the select clauses). Use 'event_type_filter'
+  #   ## to restrict which events are reported.
   #   ## Use 'id' string OR individual fields (namespace/identifier_type/identifier)
   #   [inputs.opcua_listener.events.event_type_node]
   #     id = "ns=0;i=2041"
@@ -534,8 +540,10 @@ Defining events allows subscribing to events with the specific node IDs and
 filtering criteria based on the event type and source. The plugin subscribes to
 the specified `event_type` Node-IDs and collects events that meet the defined
 criteria. The `node_ids` parameter specifies the nodes to monitor for events
-(monitored items). However, the actual subscription is based on the
-`event_type_node` determining the events to capture.
+(monitored items). The `event_type_node` determines from which event type the
+requested `fields` are resolved, while `event_type_filter` and `source_names`
+restrict which events are reported (see
+[Filtering by event type](#filtering-by-event-type)).
 
 #### Event Group Configuration
 
@@ -585,6 +593,48 @@ This example group configuration shows how to use group settings:
       identifier_type = "i"
       identifier = "5678"
 ```
+
+#### Filtering by event type
+
+`event_type_node` and `event_type_filter` serve different purposes:
+
+- `event_type_node` is the event type from which the browse paths in `fields`
+  are resolved (the `TypeDefinitionId` of the event filter's select clauses).
+  Using `BaseEventType` (`ns=0;i=2041`) works with most servers as long as the
+  requested fields are inherited by the reported events.
+- `event_type_filter` restricts the reported events to the given event types
+  and their subtypes using an `OfType` where clause. Multiple types are
+  combined with `OR`; when `source_names` is also set, both conditions must
+  match.
+
+Some servers reject vendor-specific event types as `event_type_node` (for
+example with `StatusBadMonitoredItemFilterInvalid`) while accepting them as a
+filter. The following configuration reports only events of the vendor type
+`ns=2;i=1` and its subtypes, while resolving the fields from `BaseEventType`:
+
+```toml
+[[inputs.opcua_listener.events]]
+  event_type_filter = ["ns=2;i=1"]
+  fields = ["EventId", "EventType", "Severity", "Time", "Message",
+            "ActiveState/Id", "AckedState/Id"]
+
+  [inputs.opcua_listener.events.event_type_node]
+    id = "ns=0;i=2041"
+
+  [[inputs.opcua_listener.events.node_ids]]
+    id = "ns=0;i=2253"
+```
+
+#### Event field types
+
+Event fields are converted to Telegraf field types as follows:
+
+- `LocalizedText` fields are reported as their text
+- `DateTime` fields are reported as RFC3339 strings
+- `NodeId` and `ExpandedNodeId` fields (e.g. `EventType`, `SourceNode`) are
+  reported in their string notation, e.g. `ns=2;i=1003`
+- `ByteString` fields (e.g. `EventId`) are reported as hex-encoded strings
+- all other fields are reported as-is
 
 ## Browse-based Discovery
 

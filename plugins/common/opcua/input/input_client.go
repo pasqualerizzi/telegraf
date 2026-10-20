@@ -2,6 +2,7 @@ package input
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -111,6 +112,7 @@ type EventGroupSettings struct {
 	IdentifierType   string              `toml:"identifier_type"`
 	NodeIDSettings   []EventNodeSettings `toml:"node_ids"`
 	SourceNames      []string            `toml:"source_names"`
+	EventTypeFilter  []string            `toml:"event_type_filter"`
 	Fields           []string            `toml:"fields"`
 }
 
@@ -156,6 +158,11 @@ func (e *EventGroupSettings) Validate() error {
 	}
 	if slices.Contains(e.Fields, "") {
 		return errors.New("empty field name in fields stanza")
+	}
+	for _, t := range e.EventTypeFilter {
+		if strings.TrimSpace(t) == "" {
+			return errors.New("empty node ID in event_type_filter")
+		}
 	}
 	return nil
 }
@@ -361,6 +368,7 @@ type EventNodeMetricMapping struct {
 	QueueSize        *uint32
 	EventTypeNode    *ua.NodeID
 	SourceNames      []string
+	EventTypeFilter  []*ua.NodeID
 	Fields           []string
 }
 
@@ -616,6 +624,16 @@ func (o *OpcUAInputClient) InitEventNodeIDs() error {
 		}
 		eid := ua.NewNodeIDFromExpandedNodeID(expanded)
 
+		// Parse the optional event types to filter on (OfType where clause)
+		typeFilter := make([]*ua.NodeID, 0, len(eventSetting.EventTypeFilter))
+		for _, t := range eventSetting.EventTypeFilter {
+			typeID, err := ua.ParseExpandedNodeID(strings.TrimSpace(t), namespaces)
+			if err != nil {
+				return fmt.Errorf("failed to parse event_type_filter node ID %q: %w", t, err)
+			}
+			typeFilter = append(typeFilter, ua.NewNodeIDFromExpandedNodeID(typeID))
+		}
+
 		for _, node := range eventSetting.NodeIDSettings {
 			nodeID := node.NodeID()
 			expanded, err := ua.ParseExpandedNodeID(nodeID, namespaces)
@@ -629,6 +647,7 @@ func (o *OpcUAInputClient) InitEventNodeIDs() error {
 				QueueSize:        &eventSetting.QueueSize,
 				EventTypeNode:    eid,
 				SourceNames:      eventSetting.SourceNames,
+				EventTypeFilter:  typeFilter,
 				Fields:           eventSetting.Fields,
 			}
 			o.EventNodeMetricMapping = append(o.EventNodeMetricMapping, nmm)
@@ -785,7 +804,7 @@ func (o *OpcUAInputClient) MetricForEvent(nodeIdx int, event *ua.EventFieldList)
 			}
 			fields[name] = v.Format(time.RFC3339)
 		default:
-			fields[name] = v
+			fields[name] = eventFieldValue(v)
 		}
 	}
 
@@ -883,24 +902,118 @@ func parseQualifiedName(segment string) (uint16, string) {
 	return uint16(ns), name
 }
 
+// eventFieldValue converts OPC UA event field values that Telegraf metrics
+// cannot represent natively. NodeIds would otherwise be silently dropped and
+// ByteStrings (e.g. EventId) would end up as raw, non-UTF-8 strings.
+func eventFieldValue(v any) any {
+	switch v := v.(type) {
+	case *ua.NodeID:
+		if v == nil {
+			return nil
+		}
+		return v.String()
+	case *ua.ExpandedNodeID:
+		if v == nil {
+			return nil
+		}
+		return v.String()
+	case []byte:
+		return hex.EncodeToString(v)
+	default:
+		return v
+	}
+}
+
+// filterExpr is a node in a content-filter expression tree. Leaf nodes carry
+// their operands directly, inner nodes (And/Or) reference their children.
+type filterExpr struct {
+	operator ua.FilterOperator
+	operands []*ua.ExtensionObject
+	children []*filterExpr
+}
+
+// flatten serializes the expression tree into content-filter elements. The
+// root ends up at index 0 as required by the OPC UA specification (Part 4,
+// ContentFilter), children are referenced via ElementOperands.
+func (e *filterExpr) flatten(elements []*ua.ContentFilterElement) []*ua.ContentFilterElement {
+	idx := len(elements)
+	elements = append(elements, &ua.ContentFilterElement{FilterOperator: e.operator})
+	operands := e.operands
+	for _, child := range e.children {
+		childIdx := uint32(len(elements))
+		elements = child.flatten(elements)
+		operands = append(operands, &ua.ExtensionObject{
+			EncodingMask: ua.ExtensionObjectBinary,
+			TypeID: &ua.ExpandedNodeID{
+				NodeID: ua.NewNumericNodeID(0, id.ElementOperand_Encoding_DefaultBinary),
+			},
+			Value: ua.ElementOperand{Index: childIdx},
+		})
+	}
+	elements[idx].FilterOperands = operands
+	return elements
+}
+
+// combine joins the given expressions with the binary operator op.
+func combine(op ua.FilterOperator, exprs []*filterExpr) *filterExpr {
+	if len(exprs) == 1 {
+		return exprs[0]
+	}
+	return &filterExpr{
+		operator: op,
+		children: []*filterExpr{exprs[0], combine(op, exprs[1:])},
+	}
+}
+
 func (node *EventNodeMetricMapping) createWhereClauses() (*ua.ContentFilter, error) {
-	if len(node.SourceNames) == 0 {
+	terms := make([]*filterExpr, 0, 2)
+
+	if len(node.EventTypeFilter) > 0 {
+		ofTypes := make([]*filterExpr, 0, len(node.EventTypeFilter))
+		for _, t := range node.EventTypeFilter {
+			ofTypes = append(ofTypes, &filterExpr{
+				operator: ua.FilterOperatorOfType,
+				operands: []*ua.ExtensionObject{literalOperand(t)},
+			})
+		}
+		terms = append(terms, combine(ua.FilterOperatorOr, ofTypes))
+	}
+
+	if len(node.SourceNames) > 0 {
+		inList, err := node.sourceNamesFilter()
+		if err != nil {
+			return nil, err
+		}
+		terms = append(terms, inList)
+	}
+
+	if len(terms) == 0 {
 		return &ua.ContentFilter{
 			Elements: make([]*ua.ContentFilterElement, 0),
 		}, nil
 	}
+
+	return &ua.ContentFilter{
+		Elements: combine(ua.FilterOperatorAnd, terms).flatten(nil),
+	}, nil
+}
+
+func literalOperand(value any) *ua.ExtensionObject {
+	return &ua.ExtensionObject{
+		EncodingMask: ua.ExtensionObjectBinary,
+		TypeID: &ua.ExpandedNodeID{
+			NodeID: ua.NewNumericNodeID(0, id.LiteralOperand_Encoding_DefaultBinary),
+		},
+		Value: ua.LiteralOperand{
+			Value: ua.MustVariant(value),
+		},
+	}
+}
+
+func (node *EventNodeMetricMapping) sourceNamesFilter() (*filterExpr, error) {
 	operands := make([]*ua.ExtensionObject, 0, len(node.SourceNames))
 	for _, sourceName := range node.SourceNames {
-		literalOperand := &ua.ExtensionObject{
-			EncodingMask: 1,
-			TypeID: &ua.ExpandedNodeID{
-				NodeID: ua.NewNumericNodeID(0, id.LiteralOperand_Encoding_DefaultBinary),
-			},
-			Value: ua.LiteralOperand{
-				Value: ua.MustVariant(sourceName),
-			},
-		}
-		operands = append(operands, literalOperand)
+		operands = append(operands, literalOperand(sourceName))
 	}
 
 	typeDefinition, err := node.determineNodeIDType()
@@ -922,16 +1035,10 @@ func (node *EventNodeMetricMapping) createWhereClauses() (*ua.ContentFilter, err
 		},
 	}
 
-	filterElement := &ua.ContentFilterElement{
-		FilterOperator: ua.FilterOperatorInList,
-		FilterOperands: append([]*ua.ExtensionObject{attributeOperand}, operands...),
-	}
-
-	wheres := &ua.ContentFilter{
-		Elements: []*ua.ContentFilterElement{filterElement},
-	}
-
-	return wheres, nil
+	return &filterExpr{
+		operator: ua.FilterOperatorInList,
+		operands: append([]*ua.ExtensionObject{attributeOperand}, operands...),
+	}, nil
 }
 
 func (node *EventNodeMetricMapping) determineNodeIDType() (*ua.NodeID, error) {

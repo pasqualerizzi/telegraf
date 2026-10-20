@@ -1069,6 +1069,37 @@ func TestMetricForEvent(t *testing.T) {
 				time.Time{},
 			),
 		},
+		{
+			name: "node ID and byte string fields",
+			config: InputClientConfig{
+				OpcUAClientConfig: *conf,
+				Timestamp:         TimestampSourceTelegraf,
+			},
+			mapping: []EventNodeMetricMapping{
+				{
+					NodeID:        ua.NewNumericNodeID(0, 2253),
+					EventTypeNode: ua.NewNumericNodeID(0, 2041),
+					Fields:        []string{"EventType", "SourceNode", "EventId"},
+				},
+			},
+			event: &ua.EventFieldList{
+				ClientHandle: 0,
+				EventFields: []*ua.Variant{
+					ua.MustVariant(ua.NewNumericNodeID(2, 1003)),
+					ua.MustVariant(ua.NewStringNodeID(3, "Plant/Line1")),
+					ua.MustVariant([]byte{0x40, 0x00, 0xde, 0xad, 0xbe, 0xef}),
+				},
+			},
+			expected: metric.New("opcua_event",
+				map[string]string{"node_id": "i=2253", "source": "opc.tcp://localhost:4862"},
+				map[string]any{
+					"EventType":  "ns=2;i=1003",
+					"SourceNode": "ns=3;s=Plant/Line1",
+					"EventId":    "4000deadbeef",
+				},
+				time.Time{},
+			),
+		},
 	}
 
 	for _, tt := range tests {
@@ -1570,4 +1601,89 @@ func TestCreateSelectClausesWithNamespacedFields(t *testing.T) {
 		{NamespaceIndex: 0, Name: "AckedState"},
 		{NamespaceIndex: 0, Name: "Id"},
 	}, selects[2].BrowsePath)
+}
+
+func TestCreateEventFilterWhereClause(t *testing.T) {
+	ofType := func(t *testing.T, e *ua.ContentFilterElement, expected *ua.NodeID) {
+		t.Helper()
+		require.Equal(t, ua.FilterOperatorOfType, e.FilterOperator)
+		require.Len(t, e.FilterOperands, 1)
+		lit, ok := e.FilterOperands[0].Value.(ua.LiteralOperand)
+		require.True(t, ok, "operand is %T", e.FilterOperands[0].Value)
+		require.Equal(t, expected.String(), lit.Value.Value().(*ua.NodeID).String())
+	}
+	elementRef := func(t *testing.T, o *ua.ExtensionObject) uint32 {
+		t.Helper()
+		ref, ok := o.Value.(ua.ElementOperand)
+		require.True(t, ok, "operand is %T", o.Value)
+		return ref.Index
+	}
+
+	base := EventNodeMetricMapping{
+		NodeID:        ua.NewNumericNodeID(0, 2253),
+		EventTypeNode: ua.NewNumericNodeID(0, 2041),
+		Fields:        []string{"Severity"},
+	}
+
+	t.Run("no filter", func(t *testing.T) {
+		where, err := base.createWhereClauses()
+		require.NoError(t, err)
+		require.Empty(t, where.Elements)
+	})
+
+	t.Run("single event type", func(t *testing.T) {
+		node := base
+		node.EventTypeFilter = []*ua.NodeID{ua.NewNumericNodeID(2, 1)}
+		where, err := node.createWhereClauses()
+		require.NoError(t, err)
+		require.Len(t, where.Elements, 1)
+		ofType(t, where.Elements[0], ua.NewNumericNodeID(2, 1))
+	})
+
+	t.Run("multiple event types are or-ed", func(t *testing.T) {
+		node := base
+		node.EventTypeFilter = []*ua.NodeID{ua.NewNumericNodeID(2, 1003), ua.NewNumericNodeID(2, 1006)}
+		where, err := node.createWhereClauses()
+		require.NoError(t, err)
+		require.Len(t, where.Elements, 3)
+		require.Equal(t, ua.FilterOperatorOr, where.Elements[0].FilterOperator)
+		require.Len(t, where.Elements[0].FilterOperands, 2)
+		ofType(t, where.Elements[elementRef(t, where.Elements[0].FilterOperands[0])], ua.NewNumericNodeID(2, 1003))
+		ofType(t, where.Elements[elementRef(t, where.Elements[0].FilterOperands[1])], ua.NewNumericNodeID(2, 1006))
+	})
+
+	t.Run("source names only keeps previous layout", func(t *testing.T) {
+		node := base
+		node.SourceNames = []string{"SensorXYZ", "SensorABC"}
+		where, err := node.createWhereClauses()
+		require.NoError(t, err)
+		require.Len(t, where.Elements, 1)
+		require.Equal(t, ua.FilterOperatorInList, where.Elements[0].FilterOperator)
+		require.Len(t, where.Elements[0].FilterOperands, 3)
+	})
+
+	t.Run("event type and source names are and-ed", func(t *testing.T) {
+		node := base
+		node.EventTypeFilter = []*ua.NodeID{ua.NewNumericNodeID(2, 1)}
+		node.SourceNames = []string{"SensorXYZ"}
+		where, err := node.createWhereClauses()
+		require.NoError(t, err)
+		require.Len(t, where.Elements, 3)
+		require.Equal(t, ua.FilterOperatorAnd, where.Elements[0].FilterOperator)
+		require.Len(t, where.Elements[0].FilterOperands, 2)
+		ofType(t, where.Elements[elementRef(t, where.Elements[0].FilterOperands[0])], ua.NewNumericNodeID(2, 1))
+		inList := where.Elements[elementRef(t, where.Elements[0].FilterOperands[1])]
+		require.Equal(t, ua.FilterOperatorInList, inList.FilterOperator)
+		require.Len(t, inList.FilterOperands, 2)
+	})
+}
+
+func TestEventGroupValidationEmptyEventTypeFilter(t *testing.T) {
+	group := EventGroupSettings{
+		EventTypeNode:   EventNodeSettings{NodeIDStr: "i=2041"},
+		NodeIDSettings:  []EventNodeSettings{{NodeIDStr: "i=2253"}},
+		Fields:          []string{"Severity"},
+		EventTypeFilter: []string{"ns=2;i=1", " "},
+	}
+	require.ErrorContains(t, group.Validate(), "empty node ID in event_type_filter")
 }
