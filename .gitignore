@@ -22,3 +22,5 @@ process.yml
 resource.syso
 versioninfo.json
 .uuid
+telegraf-opcua-fix.tar.gz
+/.history
